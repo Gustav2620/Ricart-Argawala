@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	pb "Ricart-agrawala/proto"
+	mutualexclusion "github.com/Gustav2620/Ricart-Argawala/proto"
 )
 
 var (
@@ -15,7 +15,7 @@ var (
 )
 
 type Node struct {
-	pb.UnimplementedMutualExclusionServer
+	mutualexclusion.UnimplementedMutualExclusionServer
 	id          int
 	port        int
 	state       State

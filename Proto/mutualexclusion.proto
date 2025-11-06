@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package mutualexclusion;
 
-option go_package = "ricart-agrawala/proto";
+option go_package = "github.com/Gustav2620/Ricart-Argawala/proto;mutualexclusion";
 
 service MutualExclusion {
   rpc RequestEntry (RequestMsg) returns (ReplyMsg);

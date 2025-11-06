@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	pb "Ricart-agrawala/proto"
+	mutualexclusion "github.com/Gustav2620/Ricart-Argawala/proto"
 
 	"google.golang.org/grpc"
 )
@@ -49,7 +49,7 @@ func (n *Node) RequestCriticalSection() {
 	n.lamportTime++
 	T := n.lamportTime
 	n.replyCount = 0
-	req := &pb.RequestMsg{
+	req := &mutualexclusion.RequestMsg{
 		NodeId:    int32(n.id),
 		Timestamp: T,
 		Port:      int32(n.port),
@@ -67,7 +67,7 @@ func (n *Node) RequestCriticalSection() {
 	n.waitForReplies(len(n.peers))
 }
 
-func (n *Node) sendRequest(peer string, req *pb.RequestMsg) {
+func (n *Node) sendRequest(peer string, req *mutualexclusion.RequestMsg) {
 	conn, err := grpc.Dial(peer,
 		grpc.WithInsecure(),
 		grpc.WithTimeout(2*time.Second), // replaces WithBlockTimeout
@@ -77,7 +77,7 @@ func (n *Node) sendRequest(peer string, req *pb.RequestMsg) {
 	}
 	defer conn.Close()
 
-	client := pb.NewMutualExclusionClient(conn)
+	client := mutualexclusion.NewMutualExclusionClient(conn)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	_, err = client.RequestEntry(ctx, req)
@@ -133,15 +133,15 @@ func (n *Node) sendReply(addr string) {
 	}
 	defer conn.Close()
 
-	client := pb.NewMutualExclusionClient(conn)
+	client := mutualexclusion.NewMutualExclusionClient(conn)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	// we only need to trigger the receiver – any message works
-	client.RequestEntry(ctx, &pb.RequestMsg{})
+	client.RequestEntry(ctx, &mutualexclusion.RequestMsg{})
 }
 
 // gRPC Handler
-func (n *Node) RequestEntry(ctx context.Context, req *pb.RequestMsg) (*pb.ReplyMsg, error) {
+func (n *Node) RequestEntry(ctx context.Context, req *mutualexclusion.RequestMsg) (*mutualexclusion.ReplyMsg, error) {
 	receivedTime := req.Timestamp
 	n.updateLamport(receivedTime)
 
@@ -157,12 +157,12 @@ func (n *Node) RequestEntry(ctx context.Context, req *pb.RequestMsg) (*pb.ReplyM
 			Port:      int(req.Port),
 		})
 		fmt.Printf("[Node %d] DEFERRED reply to Node %d (T=%d)\n", n.id, req.NodeId, receivedTime)
-		return &pb.ReplyMsg{Granted: false}, nil
+		return &mutualexclusion.ReplyMsg{Granted: false}, nil
 	} else {
 		// Immediate reply
 		fmt.Printf("[Node %d] REPLYING to Node %d (T=%d)\n", n.id, req.NodeId, receivedTime)
 		go n.sendReply(fmt.Sprintf("localhost:%d", req.Port))
-		return &pb.ReplyMsg{Granted: true}, nil
+		return &mutualexclusion.ReplyMsg{Granted: true}, nil
 	}
 }
 
@@ -172,7 +172,7 @@ func startServer(n *Node) {
 		log.Fatalf("Failed to listen: %v", err)
 	}
 	s := grpc.NewServer()
-	pb.RegisterMutualExclusionServer(s, n)
+	mutualexclusion.RegisterMutualExclusionServer(s, n)
 	fmt.Printf("[Node %d] Listening on port %d\n", n.id, n.port)
 	if err := s.Serve(lis); err != nil {
 		log.Fatalf("Failed to serve: %v", err)
