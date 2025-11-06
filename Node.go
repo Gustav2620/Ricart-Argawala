@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	mutualexclusion "github.com/Gustav2620/Ricart-Argawala/proto"
+	mutualexclusion "github.com/Gustav2620/Ricart-Argawala/grpc"
 
 	"google.golang.org/grpc"
 )
