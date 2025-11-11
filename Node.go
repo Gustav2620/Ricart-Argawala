@@ -1,180 +1,201 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"fmt"
-	"log"
+	"math/rand"
 	"net"
-	"os"
-	"strconv"
-	"strings"
+	"sync"
 	"time"
 
-	mutualexclusion "github.com/Gustav2620/Ricart-Argawala/grpc"
-
 	"google.golang.org/grpc"
+	pb "github.com/Gustav2620/Ricart-Argawala/grpc"
 )
 
-func loadPeers(filename string, selfPort int) []string {
-	file, err := os.Open(filename)
-	if err != nil {
-		log.Fatalf("Cannot open peers file: %v", err)
-	}
-	defer file.Close()
-
-	var peers []string
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		port, _ := strconv.Atoi(strings.TrimSpace(scanner.Text()))
-		if port != selfPort {
-			peers = append(peers, fmt.Sprintf("localhost:%d", port))
-		}
-	}
-	return peers
+type DeferredRequest struct {
+	ID   int
+	Addr string
 }
 
-func (n *Node) updateLamport(t int64) {
-	n.mu.Lock()
-	if t > n.lamportTime {
-		n.lamportTime = t
+type Node struct {
+	pb.UnimplementedMutualExclusionServer
+
+	id          int
+	addr        string
+	peers       map[int]string
+	clock       int64
+	mu          sync.Mutex
+	cond        *sync.Cond
+	requesting  bool
+	inCS        bool
+	myTS        int64
+	repliesRecv int
+	deferred    []DeferredRequest
+}
+
+func NewNode(id int, addr string, peers map[int]string) *Node {
+	n := &Node{
+		id:       id,
+		addr:     addr,
+		peers:    peers,
+		clock:    0,
+		deferred: make([]DeferredRequest, 0),
 	}
-	n.lamportTime++
+	n.cond = sync.NewCond(&n.mu)
+	return n
+}
+
+func (n *Node) tick() {
+	n.mu.Lock()
+	n.clock++
 	n.mu.Unlock()
 }
 
-func (n *Node) RequestCriticalSection() {
-	n.mu.Lock()
-	n.state = Wanted
-	n.lamportTime++
-	T := n.lamportTime
-	n.replyCount = 0
-	req := &mutualexclusion.RequestMsg{
-		NodeId:    int32(n.id),
-		Timestamp: T,
-		Port:      int32(n.port),
-	}
-	n.mu.Unlock()
 
-	fmt.Printf("[Node %d] REQUESTING CS at Lamport time %d\n", n.id, T)
-
-	// Multicast REQUEST to all peers
-	for _, peer := range n.peers {
-		go n.sendRequest(peer, req)
-	}
-
-	// Wait for N-1 replies
-	n.waitForReplies(len(n.peers))
-}
-
-func (n *Node) sendRequest(peer string, req *mutualexclusion.RequestMsg) {
-	conn, err := grpc.Dial(peer,
-		grpc.WithInsecure(),
-		grpc.WithTimeout(2*time.Second), // replaces WithBlockTimeout
-	)
-	if err != nil {
-		return
-	}
-	defer conn.Close()
-
-	client := mutualexclusion.NewMutualExclusionClient(conn)
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	_, err = client.RequestEntry(ctx, req)
-	if err != nil {
-		return
-	}
-
-	// count reply
-	n.mu.Lock()
-	n.replyCount++
-	n.mu.Unlock()
-}
-
-func (n *Node) waitForReplies(expected int) {
-	for {
-		n.mu.Lock()
-		if n.replyCount >= expected {
-			n.state = Held
-			n.mu.Unlock()
-			n.enterCriticalSection()
-			return
-		}
-		n.mu.Unlock()
-		time.Sleep(100 * time.Millisecond)
-	}
-}
-
-func (n *Node) enterCriticalSection() {
-	fmt.Printf(">>> [Node %d] ENTERED CRITICAL SECTION <<<\n", n.id)
-	time.Sleep(2 * time.Second) // Emulate CS work
-	fmt.Printf("<<< [Node %d] EXITING CRITICAL SECTION >>>\n", n.id)
-
-	n.mu.Lock()
-	n.state = Released
-	queue := n.queue
-	n.queue = nil
-	n.pendingReq = nil
-	n.mu.Unlock()
-
-	// Reply to all deferred requests
-	for _, req := range queue {
-		go n.sendReply(fmt.Sprintf("localhost:%d", req.Port))
-	}
-}
-
-func (n *Node) sendReply(addr string) {
-	conn, err := grpc.Dial(addr,
-		grpc.WithInsecure(),
-		grpc.WithTimeout(1*time.Second), // replaces WithBlockTimeout
-	)
-	if err != nil {
-		return
-	}
-	defer conn.Close()
-
-	client := mutualexclusion.NewMutualExclusionClient(conn)
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	// we only need to trigger the receiver – any message works
-	client.RequestEntry(ctx, &mutualexclusion.RequestMsg{})
-}
-
-// gRPC Handler
-func (n *Node) RequestEntry(ctx context.Context, req *mutualexclusion.RequestMsg) (*mutualexclusion.ReplyMsg, error) {
-	receivedTime := req.Timestamp
-	n.updateLamport(receivedTime)
-
+func (n *Node) getClock() int64 {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	return n.clock
+}
 
-	// On receive 'req(Ti,pi)'
-	if n.state == Held || (n.state == Wanted && (n.lamportTime < receivedTime || (n.lamportTime == receivedTime && n.id < int(req.NodeId)))) {
-		// Queue the request
-		n.queue = append(n.queue, RequestMsg{
-			NodeID:    int(req.NodeId),
-			Timestamp: receivedTime,
-			Port:      int(req.Port),
-		})
-		fmt.Printf("[Node %d] DEFERRED reply to Node %d (T=%d)\n", n.id, req.NodeId, receivedTime)
-		return &mutualexclusion.ReplyMsg{Granted: false}, nil
+func max(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func (n *Node) ReceiveRequest(ctx context.Context, req *pb.Request) (*pb.Empty, error) {
+	fmt.Printf("[Node %d] Received request from %d (their TS=%d) (LamportTime: %d)\n", n.id, req.SenderId, req.Timestamp, n.getClock())
+
+	priority := n.requesting && (n.myTS < req.Timestamp || (n.myTS == req.Timestamp && int32(n.id) < req.SenderId))
+
+	if priority || n.inCS {
+		n.mu.Lock()
+		n.deferred = append(n.deferred, DeferredRequest{ID: int(req.SenderId), Addr: req.SenderAddr})
+		n.mu.Unlock()
+		fmt.Printf("[Node %d] Deferred reply to %d (I have higher priority) (LamportTime: %d)\n", n.id, req.SenderId, n.getClock())
 	} else {
-		// Immediate reply
-		fmt.Printf("[Node %d] REPLYING to Node %d (T=%d)\n", n.id, req.NodeId, receivedTime)
-		go n.sendReply(fmt.Sprintf("localhost:%d", req.Port))
-		return &mutualexclusion.ReplyMsg{Granted: true}, nil
+		go n.sendReply(req.SenderAddr, int(req.SenderId))
+	}
+	return &pb.Empty{}, nil
+}
+
+func (n *Node) ReceiveReply(ctx context.Context, rep *pb.Reply) (*pb.Empty, error) {
+	n.mu.Lock()
+	n.repliesRecv++
+	n.mu.Unlock()
+	fmt.Printf("[Node %d] Received reply from %d (%d/%d replies) (LamportTime: %d)\n", n.id, rep.SenderId, n.repliesRecv, len(n.peers), n.getClock())
+	n.cond.Signal()
+	return &pb.Empty{}, nil
+}
+
+func (n *Node) sendReply(addr string, id int) {
+	n.tick()
+	conn, err := grpc.Dial(addr, grpc.WithInsecure())
+	if err != nil {
+		fmt.Printf("[Node %d] Dial failed to %d: %v (LamportTime: %d)\n", n.id, id, err, n.getClock())
+		return
+	}
+	defer conn.Close()
+
+	client := pb.NewMutualExclusionClient(conn)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	_, err = client.ReceiveReply(ctx, &pb.Reply{SenderId: int32(n.id)})
+	if err != nil {
+		fmt.Printf("[Node %d] Failed to send reply to %d: %v (LamportTime: %d)\n", n.id, id, err, n.getClock())
+	} else {
+		fmt.Printf("[Node %d] Sent reply to %d (LamportTime: %d)\n", n.id, id, n.getClock())
 	}
 }
 
-func startServer(n *Node) {
-	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", n.port))
+func (n *Node) RequestCS() {
+	n.tick()
+	n.mu.Lock()
+	n.requesting = true
+	n.myTS = n.clock
+	n.repliesRecv = 0
+	n.mu.Unlock()
+
+	fmt.Printf("[Node %d] Requesting critical section (my TS=%d) (LamportTime: %d)\n", n.id, n.myTS, n.getClock())
+
+	for peerID, peerAddr := range n.peers {
+		go func(id int, addr string) {
+			n.tick()
+			conn, err := grpc.Dial(addr, grpc.WithInsecure())
+			if err != nil {
+				fmt.Printf("[Node %d] Failed connect to %d: %v (LamportTime: %d)\n", n.id, id, err, n.getClock())
+				return
+			}
+			defer conn.Close()
+
+			client := pb.NewMutualExclusionClient(conn)
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+
+			_, err = client.ReceiveRequest(ctx, &pb.Request{
+				Timestamp:  n.myTS,
+				SenderId:   int32(n.id),
+				SenderAddr: n.addr,
+			})
+			if err != nil {
+				fmt.Printf("[Node %d] Failed send request to %d: %v (LamportTime: %d)\n", n.id, id, err, n.getClock())
+			} else {
+				fmt.Printf("[Node %d] Sent request to %d (LamportTime: %d)\n", n.id, id, n.getClock())
+			}
+		}(peerID, peerAddr)
+	}
+
+	n.mu.Lock()
+	for n.repliesRecv < len(n.peers) {
+		n.cond.Wait()
+	}
+	n.mu.Unlock()
+
+	n.tick()
+	n.mu.Lock()
+	n.requesting = false
+	n.inCS = true
+	n.mu.Unlock()
+
+	fmt.Printf("[Node %d] ENTERED CRITICAL SECTION (TS=%d) (LamportTime: %d)\n", n.id, n.myTS, n.getClock())
+	fmt.Printf("NODE %d IN CRITICAL SECTION\n", n.id)
+
+	time.Sleep(2 * time.Second)
+
+	n.tick()
+	fmt.Printf("[Node %d] EXITING CRITICAL SECTION (LamportTime: %d)\n", n.id, n.getClock())
+
+	n.mu.Lock()
+	for _, d := range n.deferred {
+		go n.sendReply(d.Addr, d.ID)
+	}
+	n.deferred = nil
+	n.inCS = false
+	n.mu.Unlock()
+}
+
+func (n *Node) StartServer() {
+	lis, err := net.Listen("tcp", n.addr)
 	if err != nil {
-		log.Fatalf("Failed to listen: %v", err)
+		fmt.Printf("[Node %d] Failed to listen on %s: %v (LamportTime: %d)\n", n.id, n.addr, err, n.getClock())
+		return
 	}
 	s := grpc.NewServer()
-	mutualexclusion.RegisterMutualExclusionServer(s, n)
-	fmt.Printf("[Node %d] Listening on port %d\n", n.id, n.port)
+	pb.RegisterMutualExclusionServer(s, n)
+	fmt.Printf("[Node %d] gRPC server started on %s (LamportTime: %d)\n", n.id, n.addr, n.getClock())
 	if err := s.Serve(lis); err != nil {
-		log.Fatalf("Failed to serve: %v", err)
+		fmt.Printf("[Node %d] Server crashed: %v (LamportTime: %d)\n", n.id, err, n.getClock())
+	}
+}
+
+func (n *Node) Run() {
+	rand.Seed(time.Now().UnixNano() + int64(n.id)*100)
+	for {
+		sleep := time.Duration(rand.Intn(10)+5) * time.Second
+		time.Sleep(sleep)
+		n.RequestCS()
 	}
 }

@@ -1,0 +1,8 @@
+# config.yaml
+nodes:
+  - id: 1
+    addr: localhost:5001
+  - id: 2
+    addr: localhost:5002
+  - id: 3
+    addr: localhost:5003

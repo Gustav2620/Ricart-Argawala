@@ -1,0 +1,22 @@
+syntax = "proto3";
+
+package mutualexclusion;
+
+option go_package = "github.com/Gustav2620/Ricart-Argawala/grpc;mutualexclusion";
+
+service MutualExclusion {
+  rpc ReceiveRequest(Request) returns (Empty);
+  rpc ReceiveReply(Reply) returns (Empty);
+}
+
+message Request {
+  int64 timestamp = 1;
+  int32 sender_id = 2;
+  string sender_addr = 3;
+}
+
+message Reply {
+  int32 sender_id = 1;
+}
+
+message Empty {}
